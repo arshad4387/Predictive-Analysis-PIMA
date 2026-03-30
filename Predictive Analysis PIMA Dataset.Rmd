@@ -1,0 +1,873 @@
+---
+title: "PIMA - Prediction Model"
+author: "Arshad Ahamed Shajahan / 25242322"
+date: "2026-03-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+set.seed(25242322)
+library(tidyverse)
+library(ggplot2)
+library(GGally)
+library(mlbench)
+library(mice)
+library(VIM)
+library(caret)
+library(randomForest)
+library(MASS)
+library(gbm)
+library(pROC)
+library(knitr)
+library(tree)
+```
+
+## PIMA Dataset
+
+```{r}
+# Loading the dataset and visualizing the summary
+
+data("PimaIndiansDiabetes2")
+pima_full <- PimaIndiansDiabetes2
+pima_cc <- na.omit(PimaIndiansDiabetes2)
+summary(pima_full)
+dim(pima_full)
+summary(pima_cc)
+dim(pima_cc)
+```
+
+```{r}
+# Look for missing data
+md.pattern(pima_full)
+
+na_summary <- colSums(is.na(pima_full))
+print(na_summary)
+```
+We can notice that there are many missing values in the data. Variable like 'Insulin' has as high as 374 missing values.
+Good thing to note is that, there are no missing values in our outcome variable 'diabetes'.
+
+Since the percentage of missing value is very high, we can create and evaluate models by complete case analysis and also by imputing missing values and compare the results between them.
+
+
+```{r}
+# Distribution of outcome variable
+pima_full %>%
+  pivot_longer(cols = -diabetes, names_to = "Variable", values_to = "Value") %>%
+  filter(!is.na(Value)) %>%
+  ggplot(aes(x = Value, fill = diabetes)) +
+  geom_density(alpha = 0.45) +
+  facet_wrap(~Variable, scales = "free", ncol = 4) +
+  scale_fill_manual(values = c("neg" = "#2A9D8F", "pos" = "#E63946")) +
+  labs(title = "Predictor Distributions by Diabetes Status",
+       x = NULL, y = "Density", fill = "Diabetes") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+
+
+```{r}
+# Correlation matrix (complete cases only for computation)
+ggpairs(pima_cc,
+        aes(colour = diabetes, alpha = 0.4),
+        upper = list(continuous = wrap("cor", size = 3)),
+        lower = list(continuous = wrap("smooth", se = FALSE, size = 0.3)),
+        diag  = list(continuous = wrap("densityDiag")),
+        columns = 1:8) +
+  labs(title = "Pairwise Relationships") +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "bottom")
+```
+
+## Complete Case Analysis
+
+```{r}
+# Data Overview
+cat("Original dataset: ", nrow(pima_full), "rows\n")
+cat("Complete cases:   ", nrow(pima_cc),   "rows\n")
+cat("Rows dropped:     ", nrow(pima_full) - nrow(pima_cc), 
+    paste0("(", round((1 - nrow(pima_cc)/nrow(pima_full))*100, 1), "% lost)\n"))
+```
+
+```{r}
+pima_full %>% mutate(Status = ifelse(complete.cases(.), "Complete", "Incomplete"))
+```
+
+## KNN Imputation
+
+```{r}
+pima_knn <- kNN(pima_full, k = 5, imp_var = FALSE)
+
+cat("KNN Imputed dataset:", nrow(pima_knn), "rows (100% retained)\n")
+cat("Missing values after imputation:", sum(is.na(pima_knn)), "\n")
+summary(pima_knn)
+```
+
+## Data Splitting
+
+```{r}
+# Splitting the dataset 70-30 for training and testing
+train_index <- createDataPartition(pima_full$diabetes, p = 0.7,list = FALSE)
+
+# Split the full dataset first
+pima_train_full <- pima_full[ train_index, ]
+pima_test_full  <- pima_full[-train_index, ]
+
+cat("Full dataset split:\n")
+cat("Training set:", nrow(pima_train_full), "rows\n")
+cat("Test set:", nrow(pima_test_full),  "rows\n")
+
+# Train-Test split for Complete Case Analysis
+pima_cc_train <- na.omit(pima_train_full)
+pima_cc_test  <- na.omit(pima_test_full)
+
+cat("\nCCA:\n")
+cat("Training set:", nrow(pima_cc_train), "rows\n")
+cat("Test set:", nrow(pima_cc_test),  "rows\n")
+cat("Train rows dropped:", nrow(pima_train_full) - nrow(pima_cc_train), "\n")
+cat("Test rows dropped: ", nrow(pima_test_full)  - nrow(pima_cc_test),  "\n")
+
+# Train-Test split for KNN Imputation
+pima_knn_train <- kNN(pima_train_full, k = 5, imp_var = FALSE)
+pima_knn_test  <- kNN(pima_test_full,  k = 5, imp_var = FALSE)
+
+cat("\nKNN:\n")
+cat("Training set:", nrow(pima_knn_train),"\n")
+cat("Test set:    ", nrow(pima_knn_test),"\n")
+```
+
+## Feature Selection
+
+```{r}
+# Backward Stepwise AIC for full and KNN imputed data
+
+# Full Model
+full_model_cca <- glm(diabetes ~ ., data = pima_cc_train, family = binomial)
+step_model_cca <- stepAIC(full_model_cca, direction = "backward", trace = FALSE)
+
+selected_cca <- names(coef(step_model_cca))[-1]
+cat("CCA selected predictors:", paste(selected_cca, collapse = ", "), "\n")
+cat("AIC for selected predictors:", round(AIC(step_model_cca), 2),
+    "| Full:", round(AIC(full_model_cca), 2), "\n")
+
+# KNN Imputed Model
+full_model_knn <- glm(diabetes ~ ., data = pima_knn_train, family = binomial)
+step_model_knn <- stepAIC(full_model_knn, direction = "backward", trace = FALSE)
+
+selected_knn <- names(coef(step_model_knn))[-1]
+cat("\nKNN Imputed selected predictors:", paste(selected_knn, collapse = ", "), "\n")
+cat("AIC for selected predictors:", round(AIC(step_model_knn), 2),
+    "| Full:", round(AIC(full_model_knn), 2), "\n")
+```
+```{r}
+# Predictor Selection
+
+predictors <- names(pima_full)[names(pima_full) != "diabetes"]
+
+var_compare <- data.frame(
+  Variable = predictors,
+  CCA      = ifelse(predictors %in% selected_cca, "✅", "❌"),
+  KNN      = ifelse(predictors %in% selected_knn, "✅", "❌")
+)
+
+knitr::kable(var_compare,
+             caption = "Variables Selected by Backward Stepwise AIC (Training Set)")
+```
+```{r}
+# Prepare the training and testing variables
+pima_cc_train_sel <- pima_cc_train %>% dplyr::select(all_of(c(selected_cca, "diabetes")))
+pima_cc_test_sel  <- pima_cc_test  %>% dplyr::select(all_of(c(selected_cca, "diabetes")))
+pima_knn_train_sel <- pima_knn_train %>% dplyr::select(all_of(c(selected_knn, "diabetes")))
+pima_knn_test_sel  <- pima_knn_test  %>% dplyr::select(all_of(c(selected_knn, "diabetes")))
+
+ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final")
+
+```
+
+## Model Fitting
+
+```{r}
+# Logistic Regression For CCA
+lr_cca <- train(diabetes ~ ., data = pima_cc_train_sel, method = "glm", family = binomial,
+  trControl = ctrl, metric = "ROC")
+print(lr_cca)
+
+# Random Forest For CCA
+rf_cca <- train(diabetes ~ ., data = pima_cc_train_sel, method= "rf", trControl  = ctrl,
+  metric = "ROC", tuneLength = 3)
+print(rf_cca)
+
+# Logistic Regression For KNN
+lr_knn <- train(diabetes ~ ., data = pima_knn_train_sel, method = "glm", family = binomial,
+  trControl = ctrl, metric = "ROC")
+print(lr_cca)
+
+# Random Forest For KNN
+rf_knn <- train(diabetes ~ ., data = pima_knn_train_sel, method= "rf", trControl  = ctrl,
+  metric = "ROC", tuneLength = 3)
+print(rf_cca)
+```
+
+## Model - Training Set Evaluation
+
+```{r}
+# Training set evaluation
+best_lr_cca <- lr_cca$results[which.max(lr_cca$results$ROC), ]
+best_rf_cca <- rf_cca$results[which.max(rf_cca$results$ROC), ]
+best_lr_knn <- lr_knn$results[which.max(lr_knn$results$ROC), ]
+best_rf_knn <- rf_knn$results[which.max(rf_knn$results$ROC), ]
+
+cv_results <- data.frame(
+  Model = c(
+    "Logistic Regression | CCA",
+    "Random Forest       | CCA",
+    "Logistic Regression | KNN",
+    "Random Forest       | KNN"),
+  AUC = round(c(best_lr_cca$ROC,  best_rf_cca$ROC,
+                best_lr_knn$ROC,  best_rf_knn$ROC),  3),
+  AUC_SD = round(c(best_lr_cca$ROCSD, best_rf_cca$ROCSD,
+                   best_lr_knn$ROCSD, best_rf_knn$ROCSD), 3),
+  Sensitivity = round(c(best_lr_cca$Sens, best_rf_cca$Sens,
+                        best_lr_knn$Sens, best_rf_knn$Sens), 3),
+  Specificity = round(c(best_lr_cca$Spec, best_rf_cca$Spec,
+                        best_lr_knn$Spec, best_rf_knn$Spec), 3))
+
+knitr::kable(cv_results,
+             col.names = c("Model", "AUC", "AUC SD",
+                           "Sensitivity", "Specificity"),
+             caption   = "10-Fold CV Performance (Training Set)")
+```
+
+
+## Prediction and Confusion Matrix
+
+```{r}
+# Logistic Regression For CCA
+pred_class_lr_cca <- predict(lr_cca,
+                              newdata = pima_cc_test_sel,
+                              type    = "raw")
+pred_prob_lr_cca  <- predict(lr_cca,
+                              newdata = pima_cc_test_sel,
+                              type    = "prob")
+cm_lr_cca <- confusionMatrix(
+  data      = factor(pred_class_lr_cca,         levels = c("neg", "pos")),
+  reference = factor(pima_cc_test_sel$diabetes, levels = c("neg", "pos")),
+  positive  = "pos")
+print(cm_lr_cca)
+
+
+# Random Forest For CCA
+pred_class_rf_cca <- predict(rf_cca,
+                              newdata = pima_cc_test_sel,
+                              type    = "raw")
+pred_prob_rf_cca  <- predict(rf_cca,
+                              newdata = pima_cc_test_sel,
+                              type    = "prob")
+cm_rf_cca <- confusionMatrix(
+  data      = factor(pred_class_rf_cca,         levels = c("neg", "pos")),
+  reference = factor(pima_cc_test_sel$diabetes, levels = c("neg", "pos")),
+  positive  = "pos")
+print(cm_rf_cca)
+
+
+# Logistic Regression For KNN
+pred_class_lr_knn <- predict(lr_knn,
+                              newdata = pima_knn_test_sel,
+                              type    = "raw")
+pred_prob_lr_knn  <- predict(lr_knn,
+                              newdata = pima_knn_test_sel,
+                              type    = "prob")
+cm_lr_knn <- confusionMatrix(
+  data      = factor(pred_class_lr_knn,          levels = c("neg", "pos")),
+  reference = factor(pima_knn_test_sel$diabetes, levels = c("neg", "pos")),
+  positive  = "pos")
+print(cm_lr_knn)
+
+
+
+# Random Forest For KNN
+pred_class_rf_knn <- predict(rf_knn,
+                              newdata = pima_knn_test_sel,
+                              type    = "raw")
+pred_prob_rf_knn  <- predict(rf_knn,
+                              newdata = pima_knn_test_sel,
+                              type    = "prob")
+cm_rf_knn <- confusionMatrix(
+  data      = factor(pred_class_rf_knn,          levels = c("neg", "pos")),
+  reference = factor(pima_knn_test_sel$diabetes, levels = c("neg", "pos")),
+  positive  = "pos")
+print(cm_rf_knn)
+```
+
+## ROC Analysis
+
+```{r}
+
+roc_lr_cca_test <- roc(pima_cc_test_sel$diabetes,  pred_prob_lr_cca$pos,
+                       levels = c("neg","pos"), direction = "<", quiet = TRUE)
+
+roc_rf_cca_test <- roc(pima_cc_test_sel$diabetes,  pred_prob_rf_cca$pos,
+                       levels = c("neg","pos"), direction = "<", quiet = TRUE)
+
+roc_lr_knn_test <- roc(pima_knn_test_sel$diabetes, pred_prob_lr_knn$pos,
+                       levels = c("neg","pos"), direction = "<", quiet = TRUE)
+
+roc_rf_knn_test <- roc(pima_knn_test_sel$diabetes, pred_prob_rf_knn$pos,
+                       levels = c("neg","pos"), direction = "<", quiet = TRUE)
+```
+
+```{r}
+roc_test_df <- bind_rows(
+  data.frame(
+    FPR   = 1 - roc_lr_cca_test$specificities,
+    TPR   = roc_lr_cca_test$sensitivities,
+    Model = paste0("LR  | CCA  (AUC=", round(auc(roc_lr_cca_test), 3), ")")
+  ),
+  data.frame(
+    FPR   = 1 - roc_rf_cca_test$specificities,
+    TPR   = roc_rf_cca_test$sensitivities,
+    Model = paste0("RF  | CCA  (AUC=", round(auc(roc_rf_cca_test), 3), ")")
+  ),
+  data.frame(
+    FPR   = 1 - roc_lr_knn_test$specificities,
+    TPR   = roc_lr_knn_test$sensitivities,
+    Model = paste0("LR  | KNN  (AUC=", round(auc(roc_lr_knn_test), 3), ")")
+  ),
+  data.frame(
+    FPR   = 1 - roc_rf_knn_test$specificities,
+    TPR   = roc_rf_knn_test$sensitivities,
+    Model = paste0("RF  | KNN  (AUC=", round(auc(roc_rf_knn_test), 3), ")")
+  )
+)
+
+ggplot(roc_test_df, aes(x = FPR, y = TPR, colour = Model)) +
+  geom_line(linewidth = 0.9) +
+  geom_abline(linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(values = c("#E63946","#457B9D","#F4A261","#2A9D8F")) +
+  labs(title    = "ROC Curves (30% Held Out Test Set)",
+       subtitle = "All four Model × Pre-processing Combinations",
+       x        = "False Positive Rate (1 – Specificity)",
+       y        = "True Positive Rate (Sensitivity)",
+       colour   = NULL) +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(face = "bold"))
+
+```
+
+## Model Summary
+
+```{r}
+## Combined Performance Summary — CV vs Test Set
+
+test_results <- data.frame(
+  Model = c(
+    "Logistic Regression | CCA",
+    "Random Forest       | CCA",
+    "Logistic Regression | KNN",
+    "Random Forest       | KNN"
+  ),
+  CV_AUC = round(c(best_lr_cca$ROC, best_rf_cca$ROC,
+                   best_lr_knn$ROC, best_rf_knn$ROC), 3),
+  Test_AUC = round(c(auc(roc_lr_cca_test), auc(roc_rf_cca_test),
+                     auc(roc_lr_knn_test), auc(roc_rf_knn_test)), 3),
+  Test_Accuracy = round(c(cm_lr_cca$overall["Accuracy"],
+                          cm_rf_cca$overall["Accuracy"],
+                          cm_lr_knn$overall["Accuracy"],
+                          cm_rf_knn$overall["Accuracy"]), 3),
+  Test_Sensitivity = round(c(cm_lr_cca$byClass["Sensitivity"],
+                             cm_rf_cca$byClass["Sensitivity"],
+                             cm_lr_knn$byClass["Sensitivity"],
+                             cm_rf_knn$byClass["Sensitivity"]), 3),
+  Test_Specificity = round(c(cm_lr_cca$byClass["Specificity"],
+                             cm_rf_cca$byClass["Specificity"],
+                             cm_lr_knn$byClass["Specificity"],
+                             cm_rf_knn$byClass["Specificity"]), 3),
+  Test_PPV = round(c(cm_lr_cca$byClass["Pos Pred Value"],
+                     cm_rf_cca$byClass["Pos Pred Value"],
+                     cm_lr_knn$byClass["Pos Pred Value"],
+                     cm_rf_knn$byClass["Pos Pred Value"]), 3),
+  Test_NPV = round(c(cm_lr_cca$byClass["Neg Pred Value"],
+                     cm_rf_cca$byClass["Neg Pred Value"],
+                     cm_lr_knn$byClass["Neg Pred Value"],
+                     cm_rf_knn$byClass["Neg Pred Value"]), 3)
+)
+
+knitr::kable(test_results,
+             col.names = c("Model", "CV AUC", "Test AUC", "Accuracy",
+                           "Sensitivity", "Specificity", "PPV", "NPV"),
+             caption   = "CV vs Test Set Performance — All Models")
+
+
+```
+
+```{r}
+
+# Visualise CV vs Test AUC side by side
+test_results %>%
+  dplyr::select(Model, CV_AUC, Test_AUC) %>%
+  pivot_longer(cols = c(CV_AUC, Test_AUC),
+               names_to  = "Phase",
+               values_to = "AUC") %>%
+  mutate(Phase = recode(Phase,
+                        "CV_AUC"   = "10-Fold CV (Train)",
+                        "Test_AUC" = "Hold-Out Test")) %>%
+  ggplot(aes(x = Model, y = AUC, fill = Phase)) +
+  geom_col(position = "dodge", width = 0.6) +
+  geom_text(aes(label = round(AUC, 3)),
+            position = position_dodge(width = 0.6),
+            vjust = -0.4, size = 3.5) +
+  scale_fill_manual(values = c("10-Fold CV (Train)" = "#457B9D",
+                               "Hold-Out Test"      = "#E63946")) +
+  scale_y_continuous(limits = c(0, 1.05)) +
+  labs(title    = "CV vs Test Set AUC — Overfitting Check",
+       subtitle = "A large drop from CV to Test indicates overfitting",
+       x = NULL, y = "AUC", fill = NULL) +
+  theme_bw(base_size = 12) +
+  theme(legend.position  = "bottom",
+        plot.title       = element_text(face = "bold"),
+        axis.text.x      = element_text(angle = 15, hjust = 1))
+```
+
+```{r}
+# Variable Importance
+vi_df <- varImp(rf_knn)$importance %>%
+  tibble::rownames_to_column("Variable") %>%
+  rename(Importance = Overall) %>%
+  arrange(desc(Importance))
+
+knitr::kable(vi_df, digits = 2,
+             caption = "Variable Importance — Random Forest | KNN (Training Set)")
+
+ggplot(vi_df, aes(x = reorder(Variable, Importance),
+                  y = Importance, fill = Importance)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_gradient(low = "#A8DADC", high = "#1D3557") +
+  labs(title    = "Variable Importance — Random Forest | KNN",
+       subtitle = "Mean Decrease in Gini (10-Fold CV on Training Set)",
+       x = NULL, y = "Importance") +
+  theme_bw(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r}
+# Identify best model by Test AUC
+best_row <- test_results[which.max(test_results$Test_AUC), ]
+
+cat("Best Model by Test AUC:\n")
+cat("  Model       :", best_row$Model,"\n")
+cat("  CV AUC      :", best_row$CV_AUC,"\n")
+cat("  Test AUC    :", best_row$Test_AUC,"\n")
+cat("  Accuracy    :", best_row$Test_Accuracy,"\n")
+cat("  Sensitivity :", best_row$Test_Sensitivity,"\n")
+cat("  Specificity :", best_row$Test_Specificity, "\n")
+cat("  PPV         :", best_row$Test_PPV,"\n")
+cat("  NPV         :", best_row$Test_NPV,"\n")
+
+```
+
+## Further Analysis on Trees
+
+```{r}
+## Fitting Trees on CCA
+
+tree_cca <- tree(diabetes ~ ., data = pima_cc_train_sel)
+summary(tree_cca)
+plot(tree_cca)
+text(tree_cca, pretty = 0)
+
+# Prediction
+tree_pred_cca <- predict(tree_cca, newdata = pima_cc_test_sel, type = "class")
+tree_prob_cca <- predict(tree_cca, newdata = pima_cc_test_sel, type = "vector")
+
+cm_tree_cca <- confusionMatrix(
+  data      = factor(tree_pred_cca,             levels = c("neg", "pos")),
+  reference = factor(pima_cc_test_sel$diabetes, levels = c("neg", "pos")),
+  positive  = "pos"
+)
+print(cm_tree_cca)
+```
+
+
+
+```{r}
+# Fitting Trees on KNN Imputed data
+
+tree_knn <- tree(diabetes ~ ., data = pima_knn_train_sel)
+summary(tree_knn)
+plot(tree_knn)
+text(tree_knn, pretty = 0)
+
+# Prediction
+tree_pred_knn <- predict(tree_knn, newdata = pima_knn_test_sel, type = "class")
+tree_prob_knn <- predict(tree_knn, newdata = pima_knn_test_sel, type = "vector")
+
+cm_tree_knn <- confusionMatrix(
+  data      = factor(tree_pred_knn,              levels = c("neg", "pos")),
+  reference = factor(pima_knn_test_sel$diabetes, levels = c("neg", "pos")),
+  positive  = "pos"
+)
+print(cm_tree_knn)
+```
+
+## Trees - Pruning
+
+```{r}
+# Pruning for CCA
+cv_tree_cca <- cv.tree(tree_cca, FUN = prune.misclass)
+
+par(mfrow = c(1, 2))
+plot(cv_tree_cca$size, cv_tree_cca$dev, type = "b")
+plot(cv_tree_cca$k, cv_tree_cca$dev, type = "b")
+par(mfrow = c(1, 1))  
+
+best_size_cca <- cv_tree_cca$size[which.min(cv_tree_cca$dev)]
+prune_cca <- prune.misclass(tree_cca, best = best_size_cca)
+
+plot(prune_cca)
+text(prune_cca, pretty = 0)
+
+# Predcition
+prune_pred_cca <- predict(prune_cca, newdata = pima_cc_test_sel, type = "class")
+prune_prob_cca <- predict(prune_cca, newdata = pima_cc_test_sel, type = "vector")
+
+cm_prune_cca <- confusionMatrix(
+  data = factor(prune_pred_cca, levels = c("neg", "pos")),
+  reference = factor(pima_cc_test_sel$diabetes, levels = c("neg", "pos")),
+  positive = "pos")
+print(cm_prune_cca)
+
+# Result
+cat("Full tree error rate: ",
+    round(mean(tree_pred_cca  != pima_cc_test_sel$diabetes), 3), "\n")
+cat("Pruned tree error rate: ",
+    round(mean(prune_pred_cca != pima_cc_test_sel$diabetes), 3), "\n")
+
+```
+
+
+```{r}
+# Pruning for KNN
+
+cv_tree_knn <- cv.tree(tree_knn, FUN = prune.misclass)
+
+par(mfrow = c(1, 2))
+plot(cv_tree_knn$size, cv_tree_knn$dev, type = "b")
+plot(cv_tree_knn$k, cv_tree_knn$dev, type = "b")
+par(mfrow = c(1, 1))
+
+best_size_knn <- cv_tree_knn$size[which.min(cv_tree_knn$dev)]
+prune_knn <- prune.misclass(tree_knn, best = best_size_knn)
+
+plot(prune_knn)
+text(prune_knn, pretty = 0)
+
+# Prediction
+prune_pred_knn <- predict(prune_knn, newdata = pima_knn_test_sel, type = "class")
+prune_prob_knn <- predict(prune_knn, newdata = pima_knn_test_sel, type = "vector")
+
+cm_prune_knn <- confusionMatrix(
+  data = factor(prune_pred_knn,             levels = c("neg", "pos")),
+  reference = factor(pima_knn_test_sel$diabetes, levels = c("neg", "pos")),
+  positive = "pos")
+print(cm_prune_knn)
+
+# Result
+cat("Full tree error rate:   ",
+    round(mean(tree_pred_knn  != pima_knn_test_sel$diabetes), 3), "\n")
+cat("Pruned tree error rate: ",
+    round(mean(prune_pred_knn != pima_knn_test_sel$diabetes), 3), "\n")
+
+```
+
+## Trees - Bagging
+
+```{r}
+# Bagging for CCA
+
+n_pred_cca <- ncol(pima_cc_train_sel) - 1
+
+bag_cca <- randomForest(
+  diabetes ~ .,
+  data       = pima_cc_train_sel,
+  mtry       = n_pred_cca,
+  ntree      = 500,
+  importance = TRUE)
+print(bag_cca)
+
+# Prediction
+bag_pred_cca <- predict(bag_cca, newdata = pima_cc_test_sel, type = "class")
+bag_prob_cca <- predict(bag_cca, newdata = pima_cc_test_sel, type = "prob")
+
+cm_bag_cca <- confusionMatrix(
+  data      = factor(bag_pred_cca,              levels = c("neg", "pos")),
+  reference = factor(pima_cc_test_sel$diabetes, levels = c("neg", "pos")),
+  positive  = "pos")
+print(cm_bag_cca)
+
+varImpPlot(bag_cca, main = "Variable Importance — Bagging | CCA")
+```
+
+
+
+```{r}
+# Bagging for KNN
+
+n_pred_knn <- ncol(pima_knn_train_sel) - 1
+
+bag_knn <- randomForest(
+  diabetes ~ .,
+  data       = pima_knn_train_sel,
+  mtry       = n_pred_knn,
+  ntree      = 500,
+  importance = TRUE)
+print(bag_knn)
+
+# PRediction
+bag_pred_knn <- predict(bag_knn, newdata = pima_knn_test_sel, type = "class")
+bag_prob_knn <- predict(bag_knn, newdata = pima_knn_test_sel, type = "prob")
+
+cm_bag_knn <- confusionMatrix(
+  data      = factor(bag_pred_knn,               levels = c("neg", "pos")),
+  reference = factor(pima_knn_test_sel$diabetes, levels = c("neg", "pos")),
+  positive  = "pos")
+print(cm_bag_knn)
+
+varImpPlot(bag_knn, main = "Variable Importance — Bagging | KNN")
+```
+
+## Trees - Boosting
+
+```{r}
+# Boosting for CCA
+
+pima_cc_train_gbm <- pima_cc_train_sel %>%
+  mutate(diabetes = ifelse(diabetes == "pos", 1, 0))
+
+pima_cc_test_gbm <- pima_cc_test_sel %>%
+  mutate(diabetes = ifelse(diabetes == "pos", 1, 0))
+
+boost_cca <- gbm(
+  diabetes ~ .,
+  data             = pima_cc_train_gbm,
+  distribution     = "bernoulli",
+  n.trees          = 5000,
+  interaction.depth = 2,
+  shrinkage        = 0.001,
+  cv.folds         = 10,
+  verbose          = FALSE)
+best_iter_cca <- gbm.perf(boost_cca, method = "cv", plot.it = FALSE)
+cat("Optimal number of trees (CCA):", best_iter_cca, "\n")
+summary(boost_cca, n.trees = best_iter_cca,
+        main = "Relative Influence — Boosting | CCA")
+
+# Prediction
+
+boost_prob_cca <- predict(boost_cca,
+                          newdata = pima_cc_test_gbm,
+                          n.trees = best_iter_cca,
+                          type    = "response")
+
+boost_pred_cca <- factor(ifelse(boost_prob_cca >= 0.5, "pos", "neg"),
+                         levels = c("neg", "pos"))
+
+
+cm_boost_cca <- confusionMatrix(
+  data      = boost_pred_cca,
+  reference = factor(pima_cc_test_sel$diabetes, levels = c("neg", "pos")),
+  positive  = "pos")
+print(cm_boost_cca)
+```
+
+```{r}
+# Boosting for KNN
+
+pima_knn_train_gbm <- pima_knn_train_sel %>%
+  mutate(diabetes = ifelse(diabetes == "pos", 1, 0))
+
+pima_knn_test_gbm <- pima_knn_test_sel %>%
+  mutate(diabetes = ifelse(diabetes == "pos", 1, 0))
+
+boost_knn <- gbm(
+  diabetes ~ .,
+  data              = pima_knn_train_gbm,
+  distribution      = "bernoulli",
+  n.trees           = 5000,
+  interaction.depth = 2,
+  shrinkage         = 0.001,
+  cv.folds          = 10,
+  verbose           = FALSE
+)
+
+best_iter_knn <- gbm.perf(boost_knn, method = "cv", plot.it = FALSE)
+cat("Optimal number of trees (KNN):", best_iter_knn, "\n")
+summary(boost_knn, n.trees = best_iter_knn,
+        main = "Relative Influence — Boosting | KNN")
+
+# Prediction
+boost_prob_knn <- predict(boost_knn,
+                          newdata = pima_knn_test_gbm,
+                          n.trees = best_iter_knn,
+                          type    = "response")
+
+boost_pred_knn <- factor(ifelse(boost_prob_knn >= 0.5, "pos", "neg"),
+                         levels = c("neg", "pos"))
+
+
+cm_boost_knn <- confusionMatrix(
+  data      = boost_pred_knn,
+  reference = factor(pima_knn_test_sel$diabetes, levels = c("neg", "pos")),
+  positive  = "pos"
+)
+print(cm_boost_knn)
+```
+
+## ROC Curve Analysis
+
+```{r}
+# ROC Curve
+
+roc_tree_cca   <- roc(pima_cc_test_sel$diabetes,  prune_prob_cca[, "pos"],
+                      levels = c("neg","pos"), direction = "<", quiet = TRUE)
+roc_tree_knn   <- roc(pima_knn_test_sel$diabetes, prune_prob_knn[, "pos"],
+                      levels = c("neg","pos"), direction = "<", quiet = TRUE)
+roc_bag_cca    <- roc(pima_cc_test_sel$diabetes,  bag_prob_cca[, "pos"],
+                      levels = c("neg","pos"), direction = "<", quiet = TRUE)
+roc_bag_knn    <- roc(pima_knn_test_sel$diabetes, bag_prob_knn[, "pos"],
+                      levels = c("neg","pos"), direction = "<", quiet = TRUE)
+roc_boost_cca  <- roc(pima_cc_test_sel$diabetes,  boost_prob_cca,
+                      levels = c("neg","pos"), direction = "<", quiet = TRUE)
+roc_boost_knn  <- roc(pima_knn_test_sel$diabetes, boost_prob_knn,
+                      levels = c("neg","pos"), direction = "<", quiet = TRUE)
+
+# Combine all models into one data frame
+roc_all_df <- bind_rows(
+  data.frame(FPR = 1 - roc_lr_cca_test$specificities,
+             TPR = roc_lr_cca_test$sensitivities,
+             Model = paste0("LR      | CCA (AUC=", round(auc(roc_lr_cca_test),  3), ")")),
+  data.frame(FPR = 1 - roc_lr_knn_test$specificities,
+             TPR = roc_lr_knn_test$sensitivities,
+             Model = paste0("LR      | KNN (AUC=", round(auc(roc_lr_knn_test),  3), ")")),
+  data.frame(FPR = 1 - roc_rf_cca_test$specificities,
+             TPR = roc_rf_cca_test$sensitivities,
+             Model = paste0("RF      | CCA (AUC=", round(auc(roc_rf_cca_test),  3), ")")),
+  data.frame(FPR = 1 - roc_rf_knn_test$specificities,
+             TPR = roc_rf_knn_test$sensitivities,
+             Model = paste0("RF      | KNN (AUC=", round(auc(roc_rf_knn_test),  3), ")")),
+  data.frame(FPR = 1 - roc_tree_cca$specificities,
+             TPR = roc_tree_cca$sensitivities,
+             Model = paste0("Tree    | CCA (AUC=", round(auc(roc_tree_cca),     3), ")")),
+  data.frame(FPR = 1 - roc_tree_knn$specificities,
+             TPR = roc_tree_knn$sensitivities,
+             Model = paste0("Tree    | KNN (AUC=", round(auc(roc_tree_knn),     3), ")")),
+  data.frame(FPR = 1 - roc_bag_cca$specificities,
+             TPR = roc_bag_cca$sensitivities,
+             Model = paste0("Bagging | CCA (AUC=", round(auc(roc_bag_cca),      3), ")")),
+  data.frame(FPR = 1 - roc_bag_knn$specificities,
+             TPR = roc_bag_knn$sensitivities,
+             Model = paste0("Bagging | KNN (AUC=", round(auc(roc_bag_knn),      3), ")")),
+  data.frame(FPR = 1 - roc_boost_cca$specificities,
+             TPR = roc_boost_cca$sensitivities,
+             Model = paste0("Boost   | CCA (AUC=", round(auc(roc_boost_cca),    3), ")")),
+  data.frame(FPR = 1 - roc_boost_knn$specificities,
+             TPR = roc_boost_knn$sensitivities,
+             Model = paste0("Boost   | KNN (AUC=", round(auc(roc_boost_knn),    3), ")")))
+
+ggplot(roc_all_df, aes(x = FPR, y = TPR, colour = Model)) +
+  geom_line(linewidth = 0.8) +
+  geom_abline(linetype = "dashed", colour = "grey50") +
+  labs(title    = "ROC Curves — All Models × All Strategies",
+       subtitle = "30% Held-Out Test Set",
+       x        = "False Positive Rate (1 – Specificity)",
+       y        = "True Positive Rate (Sensitivity)",
+       colour   = NULL) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom",
+        legend.text     = element_text(size = 8),
+        plot.title      = element_text(face = "bold")) +
+  guides(colour = guide_legend(ncol = 2))
+
+```
+
+## Consolidated Results For All Models
+
+```{r}
+all_results <- data.frame(
+  Model = c(
+    "Logistic Regression | CCA",
+    "Logistic Regression | KNN",
+    "Random Forest       | CCA",
+    "Random Forest       | KNN",
+    "Pruned Tree         | CCA",
+    "Pruned Tree         | KNN",
+    "Bagging             | CCA",
+    "Bagging             | KNN",
+    "Boosting            | CCA",
+    "Boosting            | KNN"),
+  AUC = round(c(
+    auc(roc_lr_cca_test),  auc(roc_lr_knn_test),
+    auc(roc_rf_cca_test),  auc(roc_rf_knn_test),
+    auc(roc_tree_cca),     auc(roc_tree_knn),
+    auc(roc_bag_cca),      auc(roc_bag_knn),
+    auc(roc_boost_cca),    auc(roc_boost_knn)), 3),
+  Accuracy = round(c(
+    cm_lr_cca$overall["Accuracy"],    cm_lr_knn$overall["Accuracy"],
+    cm_rf_cca$overall["Accuracy"],    cm_rf_knn$overall["Accuracy"],
+    cm_prune_cca$overall["Accuracy"], cm_prune_knn$overall["Accuracy"],
+    cm_bag_cca$overall["Accuracy"],   cm_bag_knn$overall["Accuracy"],
+    cm_boost_cca$overall["Accuracy"], cm_boost_knn$overall["Accuracy"]), 3),
+  Sensitivity = round(c(
+    cm_lr_cca$byClass["Sensitivity"],    cm_lr_knn$byClass["Sensitivity"],
+    cm_rf_cca$byClass["Sensitivity"],    cm_rf_knn$byClass["Sensitivity"],
+    cm_prune_cca$byClass["Sensitivity"], cm_prune_knn$byClass["Sensitivity"],
+    cm_bag_cca$byClass["Sensitivity"],   cm_bag_knn$byClass["Sensitivity"],
+    cm_boost_cca$byClass["Sensitivity"], cm_boost_knn$byClass["Sensitivity"]), 3),
+  Specificity = round(c(
+    cm_lr_cca$byClass["Specificity"],    cm_lr_knn$byClass["Specificity"],
+    cm_rf_cca$byClass["Specificity"],    cm_rf_knn$byClass["Specificity"],
+    cm_prune_cca$byClass["Specificity"], cm_prune_knn$byClass["Specificity"],
+    cm_bag_cca$byClass["Specificity"],   cm_bag_knn$byClass["Specificity"],
+    cm_boost_cca$byClass["Specificity"], cm_boost_knn$byClass["Specificity"]), 3),
+  PPV = round(c(
+    cm_lr_cca$byClass["Pos Pred Value"],    cm_lr_knn$byClass["Pos Pred Value"],
+    cm_rf_cca$byClass["Pos Pred Value"],    cm_rf_knn$byClass["Pos Pred Value"],
+    cm_prune_cca$byClass["Pos Pred Value"], cm_prune_knn$byClass["Pos Pred Value"],
+    cm_bag_cca$byClass["Pos Pred Value"],   cm_bag_knn$byClass["Pos Pred Value"],
+    cm_boost_cca$byClass["Pos Pred Value"], cm_boost_knn$byClass["Pos Pred Value"]), 3),
+  NPV = round(c(
+    cm_lr_cca$byClass["Neg Pred Value"],    cm_lr_knn$byClass["Neg Pred Value"],
+    cm_rf_cca$byClass["Neg Pred Value"],    cm_rf_knn$byClass["Neg Pred Value"],
+    cm_prune_cca$byClass["Neg Pred Value"], cm_prune_knn$byClass["Neg Pred Value"],
+    cm_bag_cca$byClass["Neg Pred Value"],   cm_bag_knn$byClass["Neg Pred Value"],
+    cm_boost_cca$byClass["Neg Pred Value"], cm_boost_knn$byClass["Neg Pred Value"] ), 3))
+
+knitr::kable(all_results,
+             col.names = c("Model", "AUC", "Accuracy",
+                           "Sensitivity", "Specificity", "PPV", "NPV"),
+             caption   = "Test Set Performance — All Models × All Strategies")
+```
+
+```{r}
+all_results %>%
+  arrange(desc(AUC)) %>%
+  mutate(Model = factor(Model, levels = Model)) %>%
+  ggplot(aes(x = Model, y = AUC, fill = AUC)) +
+  geom_col(show.legend = FALSE, width = 0.7) +
+  geom_text(aes(label = round(AUC, 3)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_fill_gradient(low = "#A8DADC", high = "#1D3557") +
+  scale_y_continuous(limits = c(0, 1.05)) +
+  labs(title    = "Test Set AUC — All Models Ranked",
+       subtitle = "AUC Higher the Better",
+       x = NULL, y = "AUC") +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+```
